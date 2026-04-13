@@ -1,0 +1,372 @@
+---
+title: "Assessing the Association of Genetics, Cognitive and General Function, and Imaging Biomarkers with Risk of Progression from Mild Cognitive Impairment to Dementia"
+author: "Hammang, Jack"
+date: "2/26/25"
+output:
+  pdf_document:
+    number_sections: true
+  html_document:
+    df_print: paged
+subtitle: 
+fontsize: 12pt
+editor_options:
+  markdown:
+    wrap: 72
+---
+## Project Summary
+This project analyzes how clinical, genetic, and imaging biomarkers relate to the risk of progression from mild cognitive impairment (MCI) to dementia in Alzheimer’s disease. Using data from the Alzheimer’s Disease Neuroimaging Initiative (ADNI), I applied survival analysis techniques to estimate how different predictors influence time to disease progression.
+A Cox proportional hazards model achieved strong predictive performance (concordance 0.88). Cognitive scores—particularly ADAS13—were among the strongest predictors of progression, alongside amyloid status and hippocampal volume.
+This project demonstrates how survival modeling can be used to integrate multi-domain health data and identify key drivers of disease progression.
+
+\newpage
+
+
+## Introduction 
+
+Alzheimer’s disease is a leading cause of dementia, with progression often beginning at the stage of mild cognitive impairment (MCI). However, the rate at which individuals progress from MCI to dementia varies widely.
+Understanding which factors are most associated with progression risk can help improve early intervention strategies and risk stratification.
+In this project, I use ADNI data to evaluate how cognitive scores, genetic factors (APOE4), and brain imaging biomarkers relate to time-to-dementia using survival analysis.
+
+## Methods  
+### Data Overview 
+ 
+
+
+The dataset comes from the Alzheimer’s Disease Neuroimaging Initiative (ADNI), a longitudinal study tracking individuals with mild cognitive impairment.
+
+Sample size: 604 participants
+Outcome: Time (years) to progression to dementia
+Predictors:
+Demographics: age, gender, education
+Genetics: APOE4 allele count
+Cognitive scores: ADAS13, CDRSB, MMSE, ADNI-Mem, ADNI-EF
+Imaging: amyloid status, hippocampus, ventricles, entorhinal volume
+
+Participants who did not progress to dementia during the study period were treated as right-censored at their last follow-up time.
+
+Because approximately 25% of observations had missing data, the primary analysis used complete-case data. This approach assumes data are missing completely at random (MCAR). Sensitivity analyses using simple imputation were conducted to assess robustness. Results were not significantly changed when using imputed dataset
+
+# 1. Setup --------------------------------------------------
+libraries
+```{r, set rmd options,echo= FALSE ,warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(eval=TRUE)
+knitr::opts_chunk$set(warning=FALSE)
+knitr::opts_chunk$set(error=FALSE)
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(fig.show='hide')
+```
+```{r,libraries}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(KMsurv)
+library(survival)
+library(car)
+library(knitr)
+library(gtsummary)
+```
+
+# 2. Load Data ----------------------------------------------
+```{r, load dataset}
+data <- read_csv("./data/jack_msexam_data.csv")
+```
+
+# 3. Clean + Prepare Data -----------------------------------
+```{r, cleaning}
+# add a categorical age covariate because of non-linear relationship with outcome
+data_clean <- data %>%
+  mutate(
+    amyloid = factor(AMYLOID_STATUS, labels = c("Amyloid_negative","Amyloid_positive")),
+    gender  = factor(PTGENDER, labels = c("Female","Male")),
+    dementia = factor(Dementia, labels = c("MCI","Dementia")),
+    alleles = factor(APOE4, labels = c("Zero","One","Two")),
+    age_categorical = cut(AGE, c(0,60,65,70,75,80,100))
+  ) %>%
+  select(-AMYLOID_STATUS, -PTGENDER, -APOE4)
+
+colnames(data_clean)[c(3,13)] <- c('Education', 'D_status')
+
+
+```
+missing handling
+```{r, missingness}
+# Preserve full dataset before dropping missing
+data_full <- data_clean
+data_clean <- drop_na(data_clean)
+```
+
+# 4. Feature Engineering ------------------------------------
+standardization
+```{r, standardize}
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+# Create standardized version of data to compare of effect size more intuitively
+data_standardized <- data_clean %>%
+  mutate(across(c(AGE, Education, CDRSB_bl, ADAS13_bl, MMSE_bl,
+                  Ventricles_bl, Hippocampus_bl, Entorhinal_bl),
+                standardize,
+                .names = "{.col}_standardized"))
+```
+
+# 5. Exploratory Analysis --------------------------
+Table 1
+```{r, table one,fig.show='asis',out.width="90%"}
+
+# Compare the whole data set to the subset of complete data 
+data_clean$dataset <- "Complete Cases"
+data_full$dataset <- "All Cases"
+
+combined_data <- bind_rows(data_clean, data_full)
+Table1<- combined_data %>%
+  select(
+    AGE, age_categorical, Education, gender, Years_bl, dementia, amyloid, alleles,
+    CDRSB_bl, ADAS13_bl, MMSE_bl,
+    Ventricles_bl, Hippocampus_bl, Entorhinal_bl, ADNI_EF, ADNI_MEM,
+    dataset
+  ) %>%
+  tbl_summary(by = dataset,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no"
+  ) %>%
+  bold_labels()
+```
+\newpage
+```{r, table 1}
+Table1 %>% as_kable()
+
+```
+\newpage
+
+## distributions
+
+```{r,appendix 1 data exploration visualization 1, results='markup', fig.show='asis'}
+data_clean %>% 
+  pivot_longer(col = c(2:12), names_to = 'var' , values_to = 'value'  ) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~var, , scales = 'free')+
+  labs(title = "Continuous Predictor Histograms")
+```
+```{r, appendix 1, results='markup',fig.show='asis'}
+data_clean %>% 
+  pivot_longer(col = c(14:17), names_to = 'var' , values_to = 'value'  ) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_bar() +
+  facet_wrap(~var, scales = 'free')+
+  labs(title = "Categorical Predictor Bargraphs")
+```
+
+APOE4 allele count and amyloid status were strongly correlated, so they were not included together in the same models to avoid redundancy. Other predictors showed low multicollinearity (VIF < 2), suggesting they could be included together without instability.
+
+```{r, categorical variable independence,results='markup'}
+knitr::kable(
+  table(data_full$alleles, data_full$amyloid),
+  caption = 'Alleles and Plaque Distribution'
+)
+
+chisqr_alleles_amyloid <- chisq.test(table(data_full$alleles, data_full$amyloid))
+kable(chisqr_alleles_amyloid, caption = "chi square of independence")
+```
+
+# 6. Modeling -----------------------------------------------
+final Cox model
+
+### Methods of Analysis 
+
+I used survival analysis to model time to progression from MCI to dementia.
+Model: Cox proportional hazards regression
+Baseline model: demographic variables (age, education, gender)
+Full model: added cognitive, genetic, and imaging predictors
+Model selection: based on AIC and concordance
+Diagnostics: proportional hazards and residual checks
+Kaplan-Meier curves were used to compare survival across key groups and check key model assumptions (amyloid status, APOE4 alleles).
+
+
+```{r, survival object}
+# Create survival object for dementia time/status
+ADNI.surv <- with(data_standardized, Surv(Years_bl,D_status))
+
+```
+## Non-parametric model checks
+
+### create object
+
+```{r, non-parametric survival}
+# fit non parametiric survival models
+amyloidsurv <- survfit(ADNI.surv~amyloid, data=data_standardized)
+allelesurv <- survfit(ADNI.surv~alleles, data=data_standardized)
+
+```
+
+### Non parametic Plots
+
+```{r, amyloid Proportional Hazards, results='markup', fig.show='asis',out.width="40%"}
+# Check proportional hazards assumption of cox model
+plot(amyloidsurv,col = 1:2,lwd=2) 
+title("Dementia Risk and Amyloid", xlab = 'Years', ylab = 'Proportion w/o Dementia')
+legend("bottomleft", c('amyloid Negative','amyloid Positive') ,col=1:2,lwd=2)
+
+```
+
+```{r,alleles Proportional Hazards, results='markup', fig.show='asis',out.width="40%"}
+
+plot(survfit(ADNI.surv~alleles,data=data_standardized),col = 1:3,lwd=2) 
+title("Dementia Risk by Alleles of APOE4", xlab = 'Years', ylab = 'Proportion w/o Dementia')
+legend("topright",c("Zero","One","Two"),col=1:3,lwd=2)
+
+```
+
+## Initial fit
+
+```{r, fit cox with demographic predictores}
+cox_base <- coxph(ADNI.surv~  gender + AGE + Education, data = data_clean)
+
+summary(cox_base)
+drop1(cox_base, test="Chisq")
+```
+```{r, Stratify by Age initial fit, results='markup', fig.show='asis',out.width="50%"}
+# Check the need for stratification using Schoenfeld residuals
+base_Schoenfeld <- cox.zph(cox_base)
+
+plot(base_Schoenfeld[2])
+title(main = 'Intital Fit Scheonfeld Residuals Age')
+
+```
+
+```{r, proceed with education and age strata model }
+
+cox_stratified_base <- coxph(ADNI.surv~Education + strata(age_categorical), data = data_clean)
+zph2<- cox.zph(cox_stratified_base)
+
+```
+
+### initial fit check
+
+Martingale residuals suggest the remaining base covariates are the acceptable as linear predictors of hazard.
+
+
+## full model
+
+```{r, full model and reduced fit}
+cox_full <- update(cox_stratified_base, ADNI.surv~Education +Ventricles_bl+Hippocampus_bl+Entorhinal_bl+amyloid+ ADAS13_bl+CDRSB_bl+MMSE_bl+ADNI_EF+ADNI_MEM +alleles +strata(age_categorical))
+
+cox_reduced <- update(cox_stratified_base, ADNI.surv~Education +Hippocampus_bl+amyloid+ ADAS13_bl+CDRSB_bl+ADNI_EF + strata(age_categorical))
+```
+
+```{r, model signicance and self correlation}
+# Check for collinearity in the covariates
+vif_table <- as.data.frame(vif(cox_full))
+kable(vif_table, caption = "Variance Inflation Factors")
+
+
+## Check covariate significance to arrive at reduced model
+# drop1 full model
+drop1_full <- as.data.frame(drop1(cox_full, test = "Chisq"))
+kable(drop1_full, caption = "Drop1 Results - Full Model")
+
+# anova comparison
+anova_table <- as.data.frame(anova(cox_reduced, cox_full, test = "Chisq"))
+kable(anova_table, caption = "Model Comparison")
+
+# drop1 reduced model
+drop1_reduced <- as.data.frame(drop1(cox_reduced, test = "Chisq"))
+kable(drop1_reduced, caption = "Drop1 Results - Reduced Model")
+```
+
+
+\newpage
+
+# 7. Results ------------------------------------------------
+model summary
+
+```{r, reduced model table, results='asis'}
+cox_reduced_standardized <- update(cox_reduced,
+                              ADNI.surv~Education +Hippocampus_bl_standardized+amyloid+ ADAS13_bl_standardized+CDRSB_bl_standardized+ADNI_EF + strata(age_categorical),
+                              data= data_standardized)
+
+tbl_regression(cox_reduced_standardized, exponentiate = TRUE)
+```
+
+plots
+
+ 
+
+## Results 
+
+
+
+
+
+Key Findings
+Amyloid-positive individuals had significantly higher risk of progression
+Risk increased with number of APOE4 alleles
+Cognitive scores were among the strongest predictors:
+ADAS13 performed best
+Followed by ADNI-Mem and CDRSB
+Imaging biomarkers (especially hippocampal volume) were also strong predictors
+
+Final Model
+The final Cox model included:
+Amyloid status
+Hippocampal volume
+ADAS13, CDRSB, and ADNI-EF scores
+Education (with age stratification)
+This model achieved:
+Concordance: 0.89
+Interpretation:
+Amyloid positivity increased risk 6-7x
+Higher ADAS13 and CDRSB scores increased risk
+Higher ADNI-EF and hippocampal volume were protective
+
+
+
+
+ 
+ 
+
+## Discussion:  
+
+Discussion
+This analysis highlights the value of combining information from cognitive, imaging, and biomarker tests to assess risk of dementia in individuals Alzheimers.
+Although APOE4 is a known genetic risk factor, its predictive value was reduced when amyloid status was included, likely due to strong correlation between the two.
+The final model suggests that a relatively small set of features can capture much of the variation in progression risk, which has practical implications for designing efficient screening or monitoring strategies.
+
+### Limitations 
+
+Missing data reduced the usable sample size
+Results are based on ADNI participants and may not generalize to broader populations
+Potential bias from study dropout cannot be ruled out
+ 
+\newpage
+
+# References 
+
+Chapleau, M., Iaccarino, L., Soleimani-Meigooni, D., & Rabinovici, G. D. (2022). The role of amyloid PET in imaging Neurodegenerative Disorders: a review. Journal of Nuclear Medicine, 63(Supplement 1), 13S-19S. https://doi.org/10.2967/jnumed.121.263195 
+
+Crane, P. K., Narasimhalu, K., Gibbons, L. E., Mungas, D. M.,Haneuse, S., Larson, E. B., et al. (2008). Item response theoryfacilitated cocalibrating cognitive tests and reduced bias in estimated rates of decline. Journal of Clinical Epidemiology, 61(10), 1018–1027 e1019 
+
+Crane, P.K., Carle, A, Gibbons, L. E., Insel, P.,  Mackin, R. S., Gross, A., Jones, R. N., Mukherjee, A., Curtis, S. M., Harvey, D., Weiner, M., Mungas, D. (2012). Development and assessment of a composite score for memory in the Alzheimer’s Disease Neuroimaging Initiative (ADNI). Brain Imaging and Behavior (2012) 6:502–516. 
+
+Geriatric nursing resources. (n.d.). HIGN. https://hign.org/consultgeri/resources (https://www.psychdb.com/_media/mmse.pdf)
+
+Gibbons, L. E., Carle, A. C. , Mackin, R. S. , Harvey, D., Mukherjee, S., Insel, P., Curtis  S. M., Mungas, D., Crane, P. K.  (2012). A composite score for executive functioning, validated in Alzheimer’s Disease Neuroimaging Initiative (ADNI) participants with baseline mild cognitive impairment. Brain Imaging and Behavior (2012) 6:517–527 
+
+Lu X, Zhang Y, Tang Y, Bernick C, Shan G. Conversion to Alzheimer's disease dementia from normal cognition directly or with the intermediate mild cognitive impairment stage. Alzheimer's Dement. 2025; 21:e14393. https://doi.org/10.1002/alz.14393 
+
+New Facts & Figures Report on Mild Cognitive Impairment | Mayo Clinic Connect. (n.d.). Mayo Clinic Connect. https://connect.mayoclinic.org/blog/living-with-mild-cognitive-impairment-mci/newsfeed-post/new-facts-figures-report-on-mild-cognitive-impairment/ 
+
+Nyunt, Ma Shwe Zin; Chong, Mei Sian; Lim, Wee Shiong; Lee, Tih Shih; Yap, Philip; Ng, Tze Pin (2013). "Reliability and Validity of the Clinical Dementia Rating for Community-Living Elderly Subjects without an Informant". Dementia and Geriatric Cognitive Disorders Extra. 3 (1): 407–416.  
+
+Weiner M.W., Kanoria S., Miller M.J., Aisen P.S., Beckett L.A., Conti C., Diaz A., Flenniken D., Green R.C., Harvey D.J., Jack C.R., Jagust W., Lee E.B., Morris J.C., Nho K., Nosheny R., Okonkwo O.C., Perrin R.J., Petersen R.C., Rivera-Mindt M., Saykin A.J., Shaw L.M., Toga A.W.,Tosun D.,Veitch D.P. (2024). Overview of Alzheimer’s Disease Neuroimaging Initiative and future clinical trials.The Journal of Altzheimer's Association (2024) 10.1002/alz.14321
+
+
+
+
+
+
